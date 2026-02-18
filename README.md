@@ -4,6 +4,8 @@ Firmware for **Heltec Wireless Paper v1.1 (ESP32‑S3)**: connects to Wi‑Fi, k
 
 Key feature: **quiet boot** — after reset, firmware does *not touch e‑ink* (no "Booting/Connecting" screen) until valid mapped sensor data is received.
 
+Target runtime mode is **battery-powered operation**. USB is primarily used for firmware upload and development monitoring, and only periodically for battery charging.
+
 This project targets common IoT search intents around: **ESP32‑S3**, **Heltec Wireless Paper**, **e‑ink dashboard**, **MQTT telemetry display**, and **PlatformIO firmware**.
 
 ## Features
@@ -35,7 +37,9 @@ This project targets common IoT search intents around: **ESP32‑S3**, **Heltec 
 ## Requirements
 
 - VS Code + **PlatformIO IDE** extension
-- Heltec Wireless Paper v1.1 connected via USB
+- Heltec Wireless Paper v1.1
+- USB connection only for development tasks (flash + Serial Monitor)
+- Battery for normal field/runtime operation
 
 ## Configuration
 
@@ -86,6 +90,8 @@ In PlatformIO:
 - **Build**
 - **Upload**
 - **Monitor** (115200)
+
+After development upload/verification, device is expected to run disconnected from USB (on battery), with USB used later only for maintenance and charging.
 
 ## Project structure
 
