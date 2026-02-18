@@ -17,6 +17,7 @@ This project targets common IoT search intents around: **ESP32‑S3**, **Heltec 
 - Trend arrows for temperature / humidity / pressure
 - Battery voltage read + percent estimation
 - AI-friendly structured logs (`event=... key=value`) for downstream automation
+- Adaptive deep sleep v1 (cadence learning + confidence/fallback planning)
 
 ## Keywords
 
@@ -202,14 +203,47 @@ Wireless Paper v1.x uses VBAT measurement via ADC (default config):
 - `BATTERY_ADC_CTRL_PIN` — divider/measurement control (GPIO19, active LOW)
 - `BATTERY_DIVIDER` — calibration multiplier (details in `include/secrets.h`)
 
-## Future roadmap
+## Deep sleep status
 
-- **Adaptive deep sleep (planned):**
-   - Learn broker/telemetry arrival cadence over time.
-   - Estimate next likely message window and pick sleep duration dynamically.
-   - Wake up shortly before expected data to reduce active idle time.
-   - Recalibrate continuously when cadence changes (including occasional extra packets).
-   - Goal: significantly improve battery life while preserving fresh dashboard updates.
+- **Adaptive deep sleep v1: DONE**
+   - Initial phase: continuous listening (no sleep) until minimum environmental cadence intervals are learned.
+   - Learns cadence from timestamped environmental updates (temperature / humidity / pressure).
+   - Filters short burst intervals using `DEEPSLEEP_LEARN_MIN_INTERVAL_SEC` (learning only; messages are still processed immediately).
+   - Supports broker retained-flag override (`retain_poll_15m` / `adaptive`) for event-driven sensors.
+   - If override flag disappears, firmware resets learning and returns to fresh adaptive training.
+   - Uses robust interval stats (median + MAD) and confidence scoring.
+   - Falls back to conservative wake schedule when confidence is low.
+   - Safety guards prevent runaway sleep loops (minimum awake time, MQTT-required sleep arming, empty-cycle inhibit).
+   - Emits AI logs for `cadence_update`, `cadence_miss`, `sleep_plan`, `sleep_enter`, `sleep_wake`.
+   - Additional AI logs for mode flow: `mode_flag`, `mode_switch`, `sleep_inhibit`.
+
+Implementation spec v1: `docs/adaptive-deepsleep-spec-v1.md`
+
+To enable on device, set in `include/secrets.h`:
+- `DEEPSLEEP_ENABLE 1`
+- Optional tuning: `DEEPSLEEP_MIN_INTERVAL_SAMPLES` (default `2`, sleep can start after ~3 environmental updates)
+- Optional tuning: `DEEPSLEEP_CONFIDENCE_MIN` (higher = stricter adaptive entry, lower = earlier adaptive entry)
+- Optional tuning: `DEEPSLEEP_FALLBACK_SEC` (fallback sleep while training / low confidence)
+- Optional tuning: `DEEPSLEEP_MAX_SEC` (upper bound for slow sensors, e.g. 45+ min cadence)
+- Optional retained override topic: `DEEPSLEEP_RETAIN_MODE_TOPIC`
+- Optional safety tuning: `DEEPSLEEP_MIN_AWAKE_SEC`, `DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES`
+
+### Field validation snapshot (2026-02)
+
+- Verified on real device with mixed MQTT traffic (`telemetry` + `nodeinfo` + mapped environmental payloads).
+- Adaptive learning is triggered only by mapped environmental updates (`temperature`, `relative_humidity`, `barometric_pressure`).
+- Training gate behavior confirmed:
+   - first mapped update sets baseline timestamp,
+   - next mapped updates produce `cadence_update` samples,
+   - deep sleep starts after sample threshold is reached.
+- Adaptive planning confirmed in logs:
+   - `sleep_plan mode=adaptive reason=adaptive_median`
+   - `sleep_enter sleep_sec=...`
+   - wake via `sleep_wake cause=timer`.
+- Confidence threshold strongly affects behavior:
+   - too high can keep device in fallback loop (`fallback_confidence`),
+   - tuned threshold enables adaptive operation in low-frequency streams.
+- For slow or variable cadence deployments, increase `DEEPSLEEP_MAX_SEC` above 1800 to avoid clipping adaptive plans.
 
 ## License status
 

@@ -2,6 +2,7 @@
 
 #include <time.h>
 #include <ctype.h>
+#include <stddef.h>
 
 #include <stdarg.h>
 
@@ -24,6 +25,73 @@
 #endif
 
 #define AI_LOG_SCHEMA_VERSION 1
+
+#ifndef DEEPSLEEP_ENABLE
+#define DEEPSLEEP_ENABLE 0
+#endif
+
+#ifndef DEEPSLEEP_LEARN_ENABLE
+#define DEEPSLEEP_LEARN_ENABLE 1
+#endif
+
+#ifndef DEEPSLEEP_MIN_SEC
+#define DEEPSLEEP_MIN_SEC 60
+#endif
+
+#ifndef DEEPSLEEP_MAX_SEC
+#define DEEPSLEEP_MAX_SEC (30 * 60)
+#endif
+
+#ifndef DEEPSLEEP_LISTEN_WINDOW_SEC
+#define DEEPSLEEP_LISTEN_WINDOW_SEC 90
+#endif
+
+#ifndef DEEPSLEEP_FALLBACK_SEC
+#define DEEPSLEEP_FALLBACK_SEC (5 * 60)
+#endif
+
+#ifndef DEEPSLEEP_CONFIDENCE_MIN
+#define DEEPSLEEP_CONFIDENCE_MIN 45
+#endif
+
+#ifndef DEEPSLEEP_MIN_INTERVAL_SAMPLES
+#define DEEPSLEEP_MIN_INTERVAL_SAMPLES 2
+#endif
+
+#ifndef DEEPSLEEP_LEARN_MIN_INTERVAL_SEC
+#define DEEPSLEEP_LEARN_MIN_INTERVAL_SEC 120
+#endif
+
+#ifndef DEEPSLEEP_RETAIN_MODE_TOPIC
+#define DEEPSLEEP_RETAIN_MODE_TOPIC ""
+#endif
+
+#ifndef DEEPSLEEP_RETAIN_POLL_SEC
+#define DEEPSLEEP_RETAIN_POLL_SEC (15 * 60)
+#endif
+
+#ifndef DEEPSLEEP_MIN_AWAKE_SEC
+#define DEEPSLEEP_MIN_AWAKE_SEC 30
+#endif
+
+#ifndef DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES
+#define DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES 12
+#endif
+
+#define CADENCE_MODEL_VERSION 1
+#define CADENCE_RING_SIZE 8
+#define CADENCE_MAX_INTERVAL_SEC (6 * 60 * 60)
+#define CADENCE_SAFETY_FLOOR_SEC 45
+#define CADENCE_RECONNECT_BUDGET_SEC 20
+#define CADENCE_MAD_MULTIPLIER 3
+#define CADENCE_CONFIDENCE_INC_HIT 8
+#define CADENCE_CONFIDENCE_DEC_MISS 15
+#define CADENCE_MAX_CONSECUTIVE_MISSES 3
+
+enum class SleepMode : uint8_t {
+  Adaptive = 0,
+  RetainPoll15m = 1,
+};
 
 // Heltec Wireless Paper v1.1 e-ink (2.13" BW) pin mapping from Heltec example:
 // HT_ICMEN2R13EFC1 display(rst, dc, cs, busy, sck, mosi, miso, frequency);
@@ -54,8 +122,418 @@ static bool displayInitialized = false;
 
 static volatile bool wifiDisconnectedEvent = false;
 static unsigned long logLineSeq = 0;
+static unsigned long wakeStartMs = 0;
+static bool mappedUpdateSeenThisWake = false;
+static bool sleepStateHandled = false;
+static bool trainingWaitLogged = false;
+static bool mqttConnectedThisWake = false;
+static bool retainFlagSeenThisWake = false;
+static bool sleepInhibitLogged = false;
+
+struct CadenceModel {
+  uint32_t lastMappedTs = 0;
+  uint32_t mappedIntervals[CADENCE_RING_SIZE] = {0};
+  uint8_t mappedCount = 0;
+  uint8_t mappedHead = 0;
+
+  uint32_t medianIntervalSec = 0;
+  uint32_t madSec = 0;
+
+  uint8_t confidence = 0;
+  uint8_t missedWindows = 0;
+
+  uint32_t lastPlanSleepSec = 0;
+  uint8_t lastPlanAdaptive = 0;
+
+  uint8_t mode = (uint8_t)SleepMode::Adaptive;
+  uint8_t modeSourceBroker = 0;
+  uint16_t emptySleepCycles = 0;
+  uint8_t sleepInhibit = 0;
+
+  uint8_t version = CADENCE_MODEL_VERSION;
+  uint32_t checksum = 0;
+};
+
+RTC_DATA_ATTR static CadenceModel cadenceModel;
 
 static void VextON();
+static void logAi(const char *eventName, const char *fmt, ...);
+static void cadenceSave();
+
+static const char *sleepModeToStr(SleepMode mode) {
+  return (mode == SleepMode::RetainPoll15m) ? "retain_poll_15m" : "adaptive";
+}
+
+static SleepMode cadenceMode() {
+  return (cadenceModel.mode == (uint8_t)SleepMode::RetainPoll15m) ? SleepMode::RetainPoll15m : SleepMode::Adaptive;
+}
+
+static bool hasRetainModeTopic() {
+  return strlen(DEEPSLEEP_RETAIN_MODE_TOPIC) > 0;
+}
+
+static bool isRetainModeTopic(const char *topic) {
+  if (!hasRetainModeTopic() || topic == nullptr) return false;
+  return strcmp(topic, DEEPSLEEP_RETAIN_MODE_TOPIC) == 0;
+}
+
+static void cadenceResetLearningData() {
+  cadenceModel.lastMappedTs = 0;
+  cadenceModel.mappedCount = 0;
+  cadenceModel.mappedHead = 0;
+  memset(cadenceModel.mappedIntervals, 0, sizeof(cadenceModel.mappedIntervals));
+  cadenceModel.medianIntervalSec = 0;
+  cadenceModel.madSec = 0;
+  cadenceModel.confidence = 0;
+  cadenceModel.missedWindows = 0;
+  trainingWaitLogged = false;
+}
+
+static void setSleepMode(SleepMode newMode, bool sourceBroker, bool resetLearning, const char *reason) {
+  const SleepMode oldMode = cadenceMode();
+  const bool oldSourceBroker = cadenceModel.modeSourceBroker != 0;
+
+  cadenceModel.mode = (uint8_t)newMode;
+  cadenceModel.modeSourceBroker = sourceBroker ? 1 : 0;
+
+  if (resetLearning) {
+    cadenceResetLearningData();
+  }
+
+  cadenceSave();
+
+  if (oldMode != newMode || oldSourceBroker != sourceBroker || resetLearning) {
+    logAi("mode_switch", "from=%s to=%s source=%s action=%s reason=%s",
+          sleepModeToStr(oldMode), sleepModeToStr(newMode),
+          sourceBroker ? "broker" : "default",
+          resetLearning ? "reset_learning" : "keep_state",
+          reason);
+  }
+}
+
+static void handleRetainModePayload(const String &payloadStr) {
+  String val = payloadStr;
+  val.trim();
+  val.toLowerCase();
+
+  retainFlagSeenThisWake = true;
+
+  if (val == "retain_poll_15m") {
+    setSleepMode(SleepMode::RetainPoll15m, true, false, "broker_flag");
+    logAi("mode_flag", "value=retain_poll_15m source=broker");
+    return;
+  }
+
+  if (val == "adaptive") {
+    setSleepMode(SleepMode::Adaptive, true, true, "broker_flag");
+    logAi("mode_flag", "value=adaptive source=broker");
+    return;
+  }
+
+  logAi("mode_flag", "value=unknown source=broker raw=%s", val.c_str());
+}
+
+static uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static uint32_t cadenceChecksum(const CadenceModel &model) {
+  CadenceModel copy = model;
+  copy.checksum = 0;
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < sizeof(CadenceModel); i++) {
+    hash ^= bytes[i];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static void cadenceSave() {
+  cadenceModel.version = CADENCE_MODEL_VERSION;
+  cadenceModel.checksum = cadenceChecksum(cadenceModel);
+}
+
+static void cadenceReset() {
+  memset(&cadenceModel, 0, sizeof(cadenceModel));
+  cadenceModel.version = CADENCE_MODEL_VERSION;
+  cadenceSave();
+}
+
+static bool cadenceIsValid() {
+  if (cadenceModel.version != CADENCE_MODEL_VERSION) return false;
+  return cadenceModel.checksum == cadenceChecksum(cadenceModel);
+}
+
+static void sortU32(uint32_t *arr, uint8_t n) {
+  for (uint8_t i = 1; i < n; i++) {
+    uint32_t key = arr[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && arr[j] > key) {
+      arr[j + 1] = arr[j];
+      j--;
+    }
+    arr[j + 1] = key;
+  }
+}
+
+static uint32_t medianU32(const uint32_t *arr, uint8_t n) {
+  if (n == 0) return 0;
+  if ((n & 1) == 1) return arr[n / 2];
+  const uint32_t a = arr[(n / 2) - 1];
+  const uint32_t b = arr[n / 2];
+  return (a + b) / 2;
+}
+
+static void cadenceRecomputeStats() {
+  if (cadenceModel.mappedCount == 0) {
+    cadenceModel.medianIntervalSec = 0;
+    cadenceModel.madSec = 0;
+    return;
+  }
+
+  uint32_t sorted[CADENCE_RING_SIZE];
+  for (uint8_t i = 0; i < cadenceModel.mappedCount; i++) {
+    sorted[i] = cadenceModel.mappedIntervals[i];
+  }
+  sortU32(sorted, cadenceModel.mappedCount);
+  const uint32_t med = medianU32(sorted, cadenceModel.mappedCount);
+
+  uint32_t dev[CADENCE_RING_SIZE];
+  for (uint8_t i = 0; i < cadenceModel.mappedCount; i++) {
+    const uint32_t v = cadenceModel.mappedIntervals[i];
+    dev[i] = (v >= med) ? (v - med) : (med - v);
+  }
+  sortU32(dev, cadenceModel.mappedCount);
+
+  cadenceModel.medianIntervalSec = med;
+  cadenceModel.madSec = medianU32(dev, cadenceModel.mappedCount);
+}
+
+static void cadencePushInterval(uint32_t intervalSec) {
+  cadenceModel.mappedIntervals[cadenceModel.mappedHead] = intervalSec;
+  cadenceModel.mappedHead = (uint8_t)((cadenceModel.mappedHead + 1) % CADENCE_RING_SIZE);
+  if (cadenceModel.mappedCount < CADENCE_RING_SIZE) {
+    cadenceModel.mappedCount++;
+  }
+  cadenceRecomputeStats();
+}
+
+static void cadenceOnObservedTimestamp(uint32_t tsEpoch) {
+  cadenceModel.sleepInhibit = 0;
+  cadenceModel.emptySleepCycles = 0;
+  if (!DEEPSLEEP_LEARN_ENABLE) return;
+  if (cadenceMode() != SleepMode::Adaptive) return;
+  if (tsEpoch == 0) return;
+
+  if (cadenceModel.lastMappedTs == 0) {
+    cadenceModel.lastMappedTs = tsEpoch;
+    cadenceSave();
+    return;
+  }
+
+  if (tsEpoch <= cadenceModel.lastMappedTs) {
+    return;
+  }
+
+  const uint32_t intervalSec = tsEpoch - cadenceModel.lastMappedTs;
+  if (intervalSec < DEEPSLEEP_LEARN_MIN_INTERVAL_SEC) {
+    // Important: this only skips cadence learning for burst companions
+    // (e.g. second message after 1-2s). Message processing still happens normally.
+    return;
+  }
+
+  if (intervalSec <= CADENCE_MAX_INTERVAL_SEC) {
+    cadencePushInterval(intervalSec);
+    cadenceModel.missedWindows = 0;
+    if (cadenceModel.confidence < 100) {
+      uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + 8;
+      cadenceModel.confidence = (uint8_t)((nextConfidence > 100) ? 100 : nextConfidence);
+    }
+    logAi("cadence_update", "interval_sec=%lu median_sec=%lu mad_sec=%lu samples=%u",
+          (unsigned long)intervalSec,
+          (unsigned long)cadenceModel.medianIntervalSec,
+          (unsigned long)cadenceModel.madSec,
+          (unsigned)cadenceModel.mappedCount);
+    cadenceModel.lastMappedTs = tsEpoch;
+    cadenceSave();
+  }
+}
+
+struct SleepPlan {
+  uint32_t sleepSec;
+  bool adaptive;
+  const char *reason;
+};
+
+static SleepPlan makeSleepPlan() {
+  SleepPlan plan{};
+
+  if (cadenceMode() == SleepMode::RetainPoll15m) {
+    plan.sleepSec = clampU32(DEEPSLEEP_RETAIN_POLL_SEC, DEEPSLEEP_MIN_SEC, DEEPSLEEP_MAX_SEC);
+    plan.adaptive = false;
+    plan.reason = "retain_poll_15m";
+    return plan;
+  }
+
+  plan.sleepSec = clampU32(DEEPSLEEP_FALLBACK_SEC, DEEPSLEEP_MIN_SEC, DEEPSLEEP_MAX_SEC);
+  plan.adaptive = false;
+  plan.reason = "fallback_training";
+
+  if (!DEEPSLEEP_LEARN_ENABLE) {
+    plan.reason = "fallback_learning_disabled";
+    return plan;
+  }
+
+  if (cadenceModel.missedWindows >= CADENCE_MAX_CONSECUTIVE_MISSES) {
+    plan.reason = "fallback_misses";
+    return plan;
+  }
+
+  const bool enoughSamples = cadenceModel.mappedCount >= DEEPSLEEP_MIN_INTERVAL_SAMPLES;
+  const bool confidenceOk = cadenceModel.confidence >= DEEPSLEEP_CONFIDENCE_MIN;
+
+  if (!enoughSamples) {
+    plan.reason = "fallback_training";
+    return plan;
+  }
+  if (!confidenceOk) {
+    plan.reason = "fallback_confidence";
+    return plan;
+  }
+
+  // Plan wake-up so expected environmental payload lands near the middle
+  // of active listening time after reconnect.
+  const uint32_t centerOffsetSec = (uint32_t)DEEPSLEEP_LISTEN_WINDOW_SEC / 2U;
+  const uint32_t guardSec = max<uint32_t>(CADENCE_SAFETY_FLOOR_SEC,
+                                          (CADENCE_MAD_MULTIPLIER * cadenceModel.madSec) +
+                                            CADENCE_RECONNECT_BUDGET_SEC + centerOffsetSec);
+  uint32_t adaptiveSec = DEEPSLEEP_MIN_SEC;
+  if (cadenceModel.medianIntervalSec > guardSec) {
+    adaptiveSec = cadenceModel.medianIntervalSec - guardSec;
+  }
+
+  plan.sleepSec = clampU32(adaptiveSec, DEEPSLEEP_MIN_SEC, DEEPSLEEP_MAX_SEC);
+  plan.adaptive = true;
+  plan.reason = "adaptive_median";
+  return plan;
+}
+
+static void cadenceInitFromRtc() {
+  if (!cadenceIsValid()) {
+    cadenceReset();
+  }
+}
+
+static void cadenceApplyWakeOutcome() {
+  if (cadenceMode() != SleepMode::Adaptive) return;
+  const bool expectedAdaptive = cadenceModel.lastPlanAdaptive != 0;
+  if (!expectedAdaptive) return;
+
+  if (mappedUpdateSeenThisWake) {
+    cadenceModel.missedWindows = 0;
+    uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + CADENCE_CONFIDENCE_INC_HIT;
+    cadenceModel.confidence = (uint8_t)((nextConfidence > 100) ? 100 : nextConfidence);
+  } else {
+    cadenceModel.missedWindows = (cadenceModel.missedWindows < 255) ? (uint8_t)(cadenceModel.missedWindows + 1) : (uint8_t)255;
+    cadenceModel.confidence = (cadenceModel.confidence > CADENCE_CONFIDENCE_DEC_MISS)
+                                ? (uint8_t)(cadenceModel.confidence - CADENCE_CONFIDENCE_DEC_MISS)
+                                : 0;
+    logAi("cadence_miss", "misses=%u confidence=%u",
+          (unsigned)cadenceModel.missedWindows,
+          (unsigned)cadenceModel.confidence);
+  }
+  cadenceSave();
+}
+
+static void maybeEnterDeepSleep(unsigned long nowMs) {
+  if (!DEEPSLEEP_ENABLE) return;
+  if (sleepStateHandled) return;
+
+  const unsigned long minAwakeMs = (unsigned long)DEEPSLEEP_MIN_AWAKE_SEC * 1000UL;
+  if ((nowMs - wakeStartMs) < minAwakeMs) return;
+
+  if (!mqttConnectedThisWake) {
+    if (!sleepInhibitLogged) {
+      sleepInhibitLogged = true;
+      logAi("sleep_inhibit", "reason=no_mqtt_connection");
+    }
+    return;
+  }
+
+  if (cadenceModel.sleepInhibit != 0) {
+    if (!sleepInhibitLogged) {
+      sleepInhibitLogged = true;
+      logAi("sleep_inhibit", "reason=empty_sleep_cycle_guard empty_cycles=%u threshold=%u",
+            (unsigned)cadenceModel.emptySleepCycles,
+            (unsigned)DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES);
+    }
+    return;
+  }
+
+  if (hasRetainModeTopic() && cadenceModel.modeSourceBroker != 0 && !retainFlagSeenThisWake) {
+    setSleepMode(SleepMode::Adaptive, false, true, "flag_missing");
+    logAi("mode_flag", "value=missing source=broker action=reset_to_adaptive");
+  }
+
+  const unsigned long listenWindowMs = (unsigned long)DEEPSLEEP_LISTEN_WINDOW_SEC * 1000UL;
+  if ((nowMs - wakeStartMs) < listenWindowMs) return;
+
+  if (cadenceMode() == SleepMode::Adaptive && cadenceModel.mappedCount < DEEPSLEEP_MIN_INTERVAL_SAMPLES) {
+    if (!trainingWaitLogged) {
+      trainingWaitLogged = true;
+      logAi("sleep_wait_training", "samples=%u required=%u mode=continuous_listen",
+            (unsigned)cadenceModel.mappedCount,
+            (unsigned)DEEPSLEEP_MIN_INTERVAL_SAMPLES);
+    }
+    return;
+  }
+
+  // Sample threshold reached; we can start sleep planning from now on.
+  trainingWaitLogged = false;
+
+  cadenceApplyWakeOutcome();
+
+  const SleepPlan plan = makeSleepPlan();
+
+  if (!mappedUpdateSeenThisWake && cadenceMode() == SleepMode::Adaptive) {
+    uint16_t nextEmpty = (uint16_t)(cadenceModel.emptySleepCycles + 1);
+    if (nextEmpty >= DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES) {
+      cadenceModel.sleepInhibit = 1;
+      cadenceModel.emptySleepCycles = nextEmpty;
+      cadenceSave();
+      logAi("sleep_inhibit", "reason=empty_sleep_cycle_guard empty_cycles=%u threshold=%u",
+            (unsigned)cadenceModel.emptySleepCycles,
+            (unsigned)DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES);
+      return;
+    }
+    cadenceModel.emptySleepCycles = nextEmpty;
+  } else if (mappedUpdateSeenThisWake) {
+    cadenceModel.emptySleepCycles = 0;
+  }
+
+  sleepStateHandled = true;
+  cadenceModel.lastPlanAdaptive = plan.adaptive ? 1 : 0;
+  cadenceModel.lastPlanSleepSec = plan.sleepSec;
+  cadenceSave();
+
+  logAi("sleep_plan", "mode=%s reason=%s sleep_sec=%lu median_sec=%lu mad_sec=%lu confidence=%u samples=%u misses=%u",
+        plan.adaptive ? "adaptive" : "fallback", plan.reason,
+        (unsigned long)plan.sleepSec,
+        (unsigned long)cadenceModel.medianIntervalSec,
+        (unsigned long)cadenceModel.madSec,
+        (unsigned)cadenceModel.confidence,
+        (unsigned)cadenceModel.mappedCount,
+        (unsigned)cadenceModel.missedWindows);
+  logAi("sleep_enter", "sleep_sec=%lu", (unsigned long)plan.sleepSec);
+
+  delay(50);
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup((uint64_t)plan.sleepSec * 1000000ULL);
+  esp_deep_sleep_start();
+}
 
 static unsigned long nextLogSeq() {
   return ++logLineSeq;
@@ -677,6 +1155,13 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
     return;
   }
 
+  if (length == 0 && isRetainModeTopic(topic)) {
+    setSleepMode(SleepMode::Adaptive, false, true, "flag_deleted");
+    retainFlagSeenThisWake = false;
+    logAi("mode_flag", "value=missing source=broker action=reset_to_adaptive");
+    return;
+  }
+
   if (length == 0) {
     logf("MQTT", "rx topic=%s len=0 (ignored)", topic);
     logAi("mqtt_rx_ignored", "reason=empty topic=%s", topic);
@@ -699,6 +1184,11 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
   // Construct String directly from pointer+length (avoids O(n²) char-by-char append).
   const String payloadStr((const char *)payload, length);
 
+  if (isRetainModeTopic(topic)) {
+    handleRetainModePayload(payloadStr);
+    return;
+  }
+
   char rssiBuf[16];
   if (lastWifiRssiValid) {
     snprintf(rssiBuf, sizeof(rssiBuf), "%d", lastWifiRssiDbm);
@@ -716,6 +1206,8 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
   float parsedHumidity = NAN;
   bool plainNumberParsed = false;
   const char *parseSource = "none";
+  uint32_t parsedTimestampEpoch = 0;
+  bool parsedTimestampValid = false;
 
   // 1) Try plain float (treat as temperature)
   {
@@ -753,14 +1245,18 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
       }
 
       if (!root["timestamp"].isNull()) {
-        lastMqttTimestampEpoch = root["timestamp"].as<uint32_t>();
-        lastMqttTimestampValid = (lastMqttTimestampEpoch != 0);
+        parsedTimestampEpoch = root["timestamp"].as<uint32_t>();
+        parsedTimestampValid = (parsedTimestampEpoch != 0);
+        if (parsedTimestampValid) {
+          lastMqttTimestampEpoch = parsedTimestampEpoch;
+          lastMqttTimestampValid = true;
+        }
       }
 
-      if (lastMqttTimestampValid) {
+      if (parsedTimestampValid) {
         char ts[18];
-        formatEpochDdMmHm(lastMqttTimestampEpoch, ts, sizeof(ts));
-        logf("MQTT", "json_timestamp=%lu (%s)", (unsigned long)lastMqttTimestampEpoch, ts);
+        formatEpochDdMmHm(parsedTimestampEpoch, ts, sizeof(ts));
+        logf("MQTT", "json_timestamp=%lu (%s)", (unsigned long)parsedTimestampEpoch, ts);
       }
 
       // Field mapping: can be customized in include/secrets.h
@@ -792,6 +1288,10 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
   }
 
   if (anyUpdate) {
+    mappedUpdateSeenThisWake = true;
+    if (parsedTimestampValid) {
+      cadenceOnObservedTimestamp(parsedTimestampEpoch);
+    }
     lastTempUpdateMs = millis();
     displayDirty = true;
     char tStr[16];
@@ -837,6 +1337,7 @@ static bool ensureMqttConnected() {
 
   logf("MQTT", "connected in %lums", (millis() - start));
   logAi("mqtt_connect", "result=ok elapsed_ms=%lu", (unsigned long)(millis() - start));
+  mqttConnectedThisWake = true;
 
   if (mqttClient.subscribe(MQTT_SUBSCRIBE_TOPIC)) {
     logf("MQTT", "subscribed topic=%s", MQTT_SUBSCRIBE_TOPIC);
@@ -844,6 +1345,14 @@ static bool ensureMqttConnected() {
   } else {
     logf("MQTT", "subscribe failed topic=%s", MQTT_SUBSCRIBE_TOPIC);
     logAi("mqtt_subscribe", "result=failed topic=%s", MQTT_SUBSCRIBE_TOPIC);
+  }
+
+  if (hasRetainModeTopic()) {
+    if (mqttClient.subscribe(DEEPSLEEP_RETAIN_MODE_TOPIC)) {
+      logAi("mqtt_subscribe", "result=ok topic=%s", DEEPSLEEP_RETAIN_MODE_TOPIC);
+    } else {
+      logAi("mqtt_subscribe", "result=failed topic=%s", DEEPSLEEP_RETAIN_MODE_TOPIC);
+    }
   }
 
   // Quiet boot: do not touch the display until we actually have sensor data.
@@ -856,12 +1365,23 @@ static bool ensureMqttConnected() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  wakeStartMs = millis();
+  cadenceInitFromRtc();
 
   logBootInfo();
   logf("BOOT", "quiet boot enabled: display init+draw deferred until sensor data");
-    logAi("session_start", "schema=%u fw=%s topic=%s min_refresh_ms=%lu periodic_refresh_ms=%lu",
+  logAi("session_start", "schema=%u fw=%s topic=%s min_refresh_ms=%lu periodic_refresh_ms=%lu",
       (unsigned)AI_LOG_SCHEMA_VERSION, FW_VERSION, MQTT_SUBSCRIBE_TOPIC,
       (unsigned long)DISPLAY_MIN_REFRESH_MS, (unsigned long)DISPLAY_PERIODIC_REFRESH_MS);
+    logAi("sleep_wake", "cause=%s deepsleep_enable=%u mode=%s source=%s last_plan_mode=%s last_plan_sleep_sec=%lu confidence=%u samples=%u empty_cycles=%u inhibit=%u",
+        wakeupCauseToStr(esp_sleep_get_wakeup_cause()), (unsigned)DEEPSLEEP_ENABLE,
+      sleepModeToStr(cadenceMode()), cadenceModel.modeSourceBroker ? "broker" : "default",
+        cadenceModel.lastPlanAdaptive ? "adaptive" : "fallback",
+        (unsigned long)cadenceModel.lastPlanSleepSec,
+        (unsigned)cadenceModel.confidence,
+      (unsigned)cadenceModel.mappedCount,
+      (unsigned)cadenceModel.emptySleepCycles,
+      (unsigned)cadenceModel.sleepInhibit);
 
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -942,6 +1462,8 @@ void loop() {
           refreshByDirty ? "dirty" : "periodic", (unsigned long)now,
           (unsigned long)minRefreshMs, (unsigned long)periodicRefreshMs);
   }
+
+  maybeEnterDeepSleep(now);
 
   delay(10);
 }

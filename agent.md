@@ -35,10 +35,14 @@ Before public release, ensure:
 - Secrets are not committed (`include/secrets.h` stays ignored).
 - License status is explicit in README, and a `LICENSE` file is added before public release.
 
-## Planned feature note: adaptive deep sleep
-Future implementation direction:
-- Build a lightweight cadence model from MQTT receive timestamps.
-- Keep robust stats (median interval + jitter window), not only mean.
-- Compute next wake time with a safety margin.
-- On wake: reconnect, wait for expected payload window, then refresh and sleep again.
-- Fallback to conservative behavior when cadence confidence is low.
+## Adaptive deep sleep note
+Adaptive deep sleep v1 is implemented and validated on hardware.
+
+Operational summary:
+- Cadence learning is based on mapped environmental updates.
+- Planning uses median + MAD with confidence/fallback paths.
+- Safety guards protect against fast empty-cycle sleep loops.
+- Runtime behavior and tuning notes are maintained in `README.md`.
+
+Detailed implementation spec (v1):
+- `docs/adaptive-deepsleep-spec-v1.md`
