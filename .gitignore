@@ -1,0 +1,11 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/.browse.*
+
+# Local secrets
+include/secrets.h
+
+# Local Polish documentation copies (English docs stay canonical and tracked)
+*_PL.md
+**/*_PL.md
