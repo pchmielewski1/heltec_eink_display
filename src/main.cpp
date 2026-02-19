@@ -462,7 +462,7 @@ static void maybeEnterDeepSleep(unsigned long nowMs) {
   if (!mqttConnectedThisWake) {
     if (!sleepInhibitLogged) {
       sleepInhibitLogged = true;
-      logAi("sleep_inhibit", "reason=no_mqtt_connection");
+      logAi("sleep_inhibit", "reason=no_mqtt_connection active_ms=%lu", (unsigned long)(nowMs - wakeStartMs));
     }
     return;
   }
@@ -549,10 +549,10 @@ static void maybeEnterDeepSleep(unsigned long nowMs) {
         (unsigned)cadenceModel.missedWindows);
   logAi("sleep_enter", "sleep_sec=%lu", (unsigned long)plan.sleepSec);
 
-  delay(50);
-  Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)plan.sleepSec * 1000000ULL);
+  const uint64_t sleepUs = (uint64_t)plan.sleepSec * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(sleepUs);
   esp_deep_sleep_start();
+  // We never return here.
 }
 
 static unsigned long nextLogSeq() {
@@ -961,9 +961,7 @@ static void drawTemperatureScreen() {
   formatFloatOrDash(pressureDigits, sizeof(pressureDigits), lastPressureHpa, 1, "----.-");
 
   display.clear();
-  display.update(BLACK_BUFFER);
-
-  display.clear();
+  // display.update(BLACK_BUFFER); // Removed redundant update
 
   // Big temperature: 7-seg digits (~2x, artifact-free)
   const int16_t digitH = 52;
@@ -1145,7 +1143,7 @@ static String mqttClientId() {
   return String(buf);
 }
 
-static bool tryReadFloatByKey(JsonVariant obj, const char *key, float &out) {
+static bool tryReadFloatByKey(const JsonVariant &obj, const char *key, float &out) {
   if (key == nullptr) return false;
   if (key[0] == '\0') return false;
   if (obj[key].isNull()) return false;
