@@ -85,7 +85,7 @@ struct CadenceModel {
    uint8_t mode;                     // 0=adaptive_learning, 1=retain_poll_15m
    uint8_t modeSource;               // 0=local_default, 1=broker_flag
 
-  uint32_t crc32;                   // integrity guard
+  uint32_t hash;                    // FNV-1a integrity guard
   uint8_t version;                  // model schema version
 };
 ```
@@ -150,7 +150,8 @@ if (mode == retain_poll_15m) {
       sleepSec = DEFAULT_FALLBACK_WAKE_SEC;
       reason = "fallback_training";
    } else {
-      guardSec = max(SAFETY_FLOOR_SEC, MAD_MULTIPLIER * madSec + RECONNECT_BUDGET_SEC);
+      centerOffsetSec = LISTEN_WINDOW_SEC / 2;  // center expected payload in listen window
+      guardSec = max(SAFETY_FLOOR_SEC, MAD_MULTIPLIER * madSec + RECONNECT_BUDGET_SEC + centerOffsetSec);
       targetWakeDelta = max((int32_t)medianIntervalSec - (int32_t)guardSec, (int32_t)MIN_SLEEP_SEC);
       sleepSec = clamp(targetWakeDelta, MIN_SLEEP_SEC, MAX_SLEEP_SEC);
       reason = "adaptive_median";

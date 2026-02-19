@@ -151,7 +151,7 @@ struct CadenceModel {
   uint8_t sleepInhibit = 0;
 
   uint8_t version = CADENCE_MODEL_VERSION;
-  uint32_t checksum = 0;
+  uint32_t hash = 0;
 };
 
 RTC_DATA_ATTR static CadenceModel cadenceModel;
@@ -241,7 +241,7 @@ static uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
 
 static uint32_t cadenceChecksum(const CadenceModel &model) {
   CadenceModel copy = model;
-  copy.checksum = 0;
+  copy.hash = 0;
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
   uint32_t hash = 2166136261u;
   for (size_t i = 0; i < sizeof(CadenceModel); i++) {
@@ -253,7 +253,7 @@ static uint32_t cadenceChecksum(const CadenceModel &model) {
 
 static void cadenceSave() {
   cadenceModel.version = CADENCE_MODEL_VERSION;
-  cadenceModel.checksum = cadenceChecksum(cadenceModel);
+  cadenceModel.hash = cadenceChecksum(cadenceModel);
 }
 
 static void cadenceReset() {
@@ -264,7 +264,7 @@ static void cadenceReset() {
 
 static bool cadenceIsValid() {
   if (cadenceModel.version != CADENCE_MODEL_VERSION) return false;
-  return cadenceModel.checksum == cadenceChecksum(cadenceModel);
+  return cadenceModel.hash == cadenceChecksum(cadenceModel);
 }
 
 static void sortU32(uint32_t *arr, uint8_t n) {
@@ -349,7 +349,7 @@ static void cadenceOnObservedTimestamp(uint32_t tsEpoch) {
     cadencePushInterval(intervalSec);
     cadenceModel.missedWindows = 0;
     if (cadenceModel.confidence < 100) {
-      uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + 8;
+      uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + CADENCE_CONFIDENCE_INC_HIT;
       cadenceModel.confidence = (uint8_t)((nextConfidence > 100) ? 100 : nextConfidence);
     }
     logAi("cadence_update", "interval_sec=%lu median_sec=%lu mad_sec=%lu samples=%u",
