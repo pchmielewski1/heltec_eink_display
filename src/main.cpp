@@ -491,6 +491,22 @@ static void maybeEnterDeepSleep(unsigned long nowMs) {
     return;
   }
 
+  // If we repeatedly miss expected windows, reset learning and return
+  // to continuous listening so the model can re-lock to current cadence.
+  if (cadenceMode() == SleepMode::Adaptive &&
+      cadenceModel.missedWindows >= CADENCE_MAX_CONSECUTIVE_MISSES &&
+      !mappedUpdateSeenThisWake) {
+    const uint8_t missesBeforeReset = cadenceModel.missedWindows;
+    cadenceResetLearningData();
+    cadenceModel.emptySleepCycles = 0;
+    cadenceModel.sleepInhibit = 0;
+    cadenceSave();
+    logAi("cadence_retrain", "reason=consecutive_misses misses=%u threshold=%u action=continuous_listen",
+          (unsigned)missesBeforeReset,
+          (unsigned)CADENCE_MAX_CONSECUTIVE_MISSES);
+    return;
+  }
+
   // Sample threshold reached; we can start sleep planning from now on.
   trainingWaitLogged = false;
 
