@@ -80,17 +80,19 @@ struct CadenceModel {
   uint8_t missedWindows;            // consecutive misses
 
   uint32_t lastPlanSleepSec;        // last planned sleep duration
-  uint32_t lastWakeEpoch;           // best-effort wallclock checkpoint
+  uint8_t lastPlanAdaptive;         // 1 if last plan was adaptive, 0 if fallback
 
-   uint8_t mode;                     // 0=adaptive_learning, 1=retain_poll_15m
-   uint8_t modeSource;               // 0=local_default, 1=broker_flag
+  uint8_t mode;                     // 0=adaptive_learning, 1=retain_poll_15m
+  uint8_t modeSourceBroker;         // 0=local_default, 1=broker_flag
+  uint16_t emptySleepCycles;        // consecutive sleep cycles without mapped update
+  uint8_t sleepInhibit;             // 1=sleep blocked by empty-cycle guard
 
-  uint32_t hash;                    // FNV-1a integrity guard
   uint8_t version;                  // model schema version
+  uint32_t hash;                    // FNV-1a integrity guard
 };
 ```
 
-If CRC/version invalid: reset model and start conservative mode.
+If hash/version invalid: reset model and start conservative mode.
 
 ## Timing constants (v1 defaults)
 
@@ -126,8 +128,9 @@ This profile reduces fallback loops in slow streams while preserving safety boun
 
 When a new `mapped_update` arrives with valid payload timestamp:
 1. `interval = ts_now - lastMappedTs`.
-2. Accept interval only if `30s <= interval <= 6h`.
+2. Accept interval only if `DEEPSLEEP_LEARN_MIN_INTERVAL_SEC <= interval <= 6h`.
 3. Push into ring buffer.
+4. If interval exceeds 6h, skip learning but still update `lastMappedTs` to avoid model freeze.
 4. Compute `medianIntervalSec` from valid intervals.
 5. Compute `madSec = median(|interval_i - medianIntervalSec|)`.
 
@@ -185,13 +188,18 @@ Mode transition rules:
 
 - Hit in expected window: `confidence = min(100, confidence + CONFIDENCE_INC_HIT)`
 - Missed expected window: `confidence = max(0, confidence - CONFIDENCE_DEC_MISS)`
-- If `missedWindows >= MAX_CONSECUTIVE_MISSES`, force fallback until 2 consecutive hits.
+- If `missedWindows >= MAX_CONSECUTIVE_MISSES`: reset cadence model and return to
+  continuous listening (retrain from scratch). Emits `cadence_retrain` AI log.
+
+Note: confidence is updated only in `cadenceApplyWakeOutcome()` (once per wake cycle).
+The cadence learning path (`cadenceOnObservedTimestamp()`) does not modify confidence
+to avoid double-counting in the same wake cycle.
 
 ## Integration points in firmware
 
 - `mqttCallback(...)`
-  - on `data_update`: call `cadenceOnMappedUpdate(timestamp)`.
-  - on `data_noop`: call `cadenceOnNoop(timestamp)` (lightweight, optional).
+  - on `data_update`: call `cadenceOnObservedTimestamp(timestamp)`.
+  - on `data_noop`: no cadence action (lightweight, optional future hook).
 
 - main control path (`setup/loop` split for deep-sleep mode)
   - after listen window completion: call `planNextSleep()`.

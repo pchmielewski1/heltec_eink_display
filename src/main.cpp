@@ -348,18 +348,22 @@ static void cadenceOnObservedTimestamp(uint32_t tsEpoch) {
   if (intervalSec <= CADENCE_MAX_INTERVAL_SEC) {
     cadencePushInterval(intervalSec);
     cadenceModel.missedWindows = 0;
-    if (cadenceModel.confidence < 100) {
-      uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + CADENCE_CONFIDENCE_INC_HIT;
-      cadenceModel.confidence = (uint8_t)((nextConfidence > 100) ? 100 : nextConfidence);
-    }
+    // Confidence increment happens only in cadenceApplyWakeOutcome()
+    // to avoid double-counting when both paths run in the same wake cycle.
     logAi("cadence_update", "interval_sec=%lu median_sec=%lu mad_sec=%lu samples=%u",
           (unsigned long)intervalSec,
           (unsigned long)cadenceModel.medianIntervalSec,
           (unsigned long)cadenceModel.madSec,
           (unsigned)cadenceModel.mappedCount);
-    cadenceModel.lastMappedTs = tsEpoch;
-    cadenceSave();
+  } else {
+    // Interval exceeds 6h — too long for learning, but update baseline
+    // so the next observation starts from a fresh reference point.
+    logAi("cadence_update", "interval_sec=%lu status=rejected_too_long max=%lu",
+          (unsigned long)intervalSec, (unsigned long)CADENCE_MAX_INTERVAL_SEC);
   }
+
+  cadenceModel.lastMappedTs = tsEpoch;
+  cadenceSave();
 }
 
 struct SleepPlan {
