@@ -372,7 +372,7 @@ struct SleepPlan {
   const char *reason;
 };
 
-static SleepPlan makeSleepPlan() {
+static SleepPlan makeSleepPlan(uint32_t awakeAfterDataSec) {
   SleepPlan plan{};
 
   if (cadenceMode() == SleepMode::RetainPoll15m) {
@@ -403,20 +403,39 @@ static SleepPlan makeSleepPlan() {
     plan.reason = "fallback_training";
     return plan;
   }
-  if (!confidenceOk) {
-    plan.reason = "fallback_confidence";
-    return plan;
-  }
 
-  // Plan wake-up so expected environmental payload lands near the middle
-  // of active listening time after reconnect.
+  // Compute wake-up guard for landing near the middle of the listen window.
   const uint32_t centerOffsetSec = (uint32_t)DEEPSLEEP_LISTEN_WINDOW_SEC / 2U;
   const uint32_t guardSec = max<uint32_t>(CADENCE_SAFETY_FLOOR_SEC,
                                           (CADENCE_MAD_MULTIPLIER * cadenceModel.madSec) +
                                             CADENCE_RECONNECT_BUDGET_SEC + centerOffsetSec);
+
+  // Drift compensation: subtract time spent awake after receiving data
+  // so sleep anchors to data arrival, preventing cumulative clock drift.
+  // Without this, each cycle drifts by ~(listenWindow - dataArrivalOffset)
+  // seconds, causing data to fall outside the wake window after a few cycles.
+  uint32_t effectiveMedian = cadenceModel.medianIntervalSec;
+  if (awakeAfterDataSec > 0 && awakeAfterDataSec < effectiveMedian) {
+    effectiveMedian -= awakeAfterDataSec;
+  }
+
+  if (!confidenceOk) {
+    // Not enough confidence for full adaptive, but use median-based timing
+    // with drift compensation so the device can actually catch data and
+    // build confidence.  Fixed fallback (1800s) drifts relative to the
+    // data cadence and makes confidence growth nearly impossible.
+    uint32_t fallbackSec = DEEPSLEEP_FALLBACK_SEC;
+    if (effectiveMedian > guardSec) {
+      fallbackSec = effectiveMedian - guardSec;
+    }
+    plan.sleepSec = clampU32(fallbackSec, DEEPSLEEP_MIN_SEC, DEEPSLEEP_MAX_SEC);
+    plan.reason = "fallback_confidence";
+    return plan;
+  }
+
   uint32_t adaptiveSec = DEEPSLEEP_MIN_SEC;
-  if (cadenceModel.medianIntervalSec > guardSec) {
-    adaptiveSec = cadenceModel.medianIntervalSec - guardSec;
+  if (effectiveMedian > guardSec) {
+    adaptiveSec = effectiveMedian - guardSec;
   }
 
   plan.sleepSec = clampU32(adaptiveSec, DEEPSLEEP_MIN_SEC, DEEPSLEEP_MAX_SEC);
@@ -433,21 +452,32 @@ static void cadenceInitFromRtc() {
 
 static void cadenceApplyWakeOutcome() {
   if (cadenceMode() != SleepMode::Adaptive) return;
-  const bool expectedAdaptive = cadenceModel.lastPlanAdaptive != 0;
-  if (!expectedAdaptive) return;
+
+  // Confidence must grow on hits even when the last plan was fallback,
+  // otherwise confidence stays at 0 forever once it drops below the
+  // adaptive threshold (deadlock: adaptive needs confidence, confidence
+  // needs adaptive).
+  const bool wasAdaptivePlan = cadenceModel.lastPlanAdaptive != 0;
 
   if (mappedUpdateSeenThisWake) {
     cadenceModel.missedWindows = 0;
     uint16_t nextConfidence = (uint16_t)cadenceModel.confidence + CADENCE_CONFIDENCE_INC_HIT;
     cadenceModel.confidence = (uint8_t)((nextConfidence > 100) ? 100 : nextConfidence);
   } else {
+    // Always track misses so the retrain trigger (missedWindows >= 3)
+    // can fire even when the device is in fallback mode.
     cadenceModel.missedWindows = (cadenceModel.missedWindows < 255) ? (uint8_t)(cadenceModel.missedWindows + 1) : (uint8_t)255;
-    cadenceModel.confidence = (cadenceModel.confidence > CADENCE_CONFIDENCE_DEC_MISS)
-                                ? (uint8_t)(cadenceModel.confidence - CADENCE_CONFIDENCE_DEC_MISS)
-                                : 0;
-    logAi("cadence_miss", "misses=%u confidence=%u",
+    // Only penalize confidence when the last plan was adaptive — fallback
+    // timing is not tuned to the data cadence, so misses are expected.
+    if (wasAdaptivePlan) {
+      cadenceModel.confidence = (cadenceModel.confidence > CADENCE_CONFIDENCE_DEC_MISS)
+                                  ? (uint8_t)(cadenceModel.confidence - CADENCE_CONFIDENCE_DEC_MISS)
+                                  : 0;
+    }
+    logAi("cadence_miss", "misses=%u confidence=%u plan=%s",
           (unsigned)cadenceModel.missedWindows,
-          (unsigned)cadenceModel.confidence);
+          (unsigned)cadenceModel.confidence,
+          wasAdaptivePlan ? "adaptive" : "fallback");
   }
   cadenceSave();
 }
@@ -516,7 +546,14 @@ static void maybeEnterDeepSleep(unsigned long nowMs) {
 
   cadenceApplyWakeOutcome();
 
-  const SleepPlan plan = makeSleepPlan();
+  // Compute how long the device has been awake since last data arrived.
+  // This anchors the sleep timer to data arrival, eliminating cumulative
+  // drift that otherwise shifts the wake window away from the data cadence.
+  uint32_t awakeAfterDataSec = 0;
+  if (mappedUpdateSeenThisWake && lastTempUpdateMs > 0 && nowMs > lastTempUpdateMs) {
+    awakeAfterDataSec = (uint32_t)((nowMs - lastTempUpdateMs) / 1000UL);
+  }
+  const SleepPlan plan = makeSleepPlan(awakeAfterDataSec);
 
   if (!mappedUpdateSeenThisWake && cadenceMode() == SleepMode::Adaptive) {
     uint16_t nextEmpty = (uint16_t)(cadenceModel.emptySleepCycles + 1);

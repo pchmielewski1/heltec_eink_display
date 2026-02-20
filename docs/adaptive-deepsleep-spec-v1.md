@@ -145,22 +145,44 @@ Run planning after successful processing cycle and before entering deep sleep.
 Pseudo logic:
 
 ```c
+awakeAfterDataSec = (nowMs - lastTempUpdateMs) / 1000;  // 0 when no data this cycle
+
 if (mode == retain_poll_15m) {
    sleepSec = RETAIN_POLL_INTERVAL_SEC;
    reason = "retain_poll_15m";
 } else {
-   if (mappedCount < MIN_TRAINING_SAMPLES || confidence < CONFIDENCE_MIN_FOR_ADAPTIVE) {
+   centerOffsetSec = LISTEN_WINDOW_SEC / 2;
+   guardSec = max(SAFETY_FLOOR_SEC, MAD_MULTIPLIER * madSec + RECONNECT_BUDGET_SEC + centerOffsetSec);
+
+   // Drift compensation: subtract time spent awake after data so that
+   // sleep anchors to data arrival, not to sleep entry.
+   effectiveMedian = medianIntervalSec - awakeAfterDataSec;
+
+   if (mappedCount < MIN_TRAINING_SAMPLES) {
       sleepSec = DEFAULT_FALLBACK_WAKE_SEC;
       reason = "fallback_training";
+   } else if (confidence < CONFIDENCE_MIN_FOR_ADAPTIVE) {
+      // Use median-based timing even before confidence is established
+      // so the device can catch data and build confidence.
+      sleepSec = clamp(effectiveMedian - guardSec, MIN_SLEEP_SEC, MAX_SLEEP_SEC);
+      reason = "fallback_confidence";
    } else {
-      centerOffsetSec = LISTEN_WINDOW_SEC / 2;  // center expected payload in listen window
-      guardSec = max(SAFETY_FLOOR_SEC, MAD_MULTIPLIER * madSec + RECONNECT_BUDGET_SEC + centerOffsetSec);
-      targetWakeDelta = max((int32_t)medianIntervalSec - (int32_t)guardSec, (int32_t)MIN_SLEEP_SEC);
-      sleepSec = clamp(targetWakeDelta, MIN_SLEEP_SEC, MAX_SLEEP_SEC);
+      sleepSec = clamp(effectiveMedian - guardSec, MIN_SLEEP_SEC, MAX_SLEEP_SEC);
       reason = "adaptive_median";
    }
 }
 ```
+
+### Drift compensation
+
+Without drift compensation, the device cycle (sleep + awake) is longer than the
+data interval by the awake-after-data time. Each cycle, data arrives earlier
+relative to the wake window. After several cycles, data falls outside the window
+entirely.
+
+The fix subtracts `awakeAfterDataSec` from the median when computing sleep,
+anchoring the timer to data arrival rather than sleep entry. This eliminates
+cumulative drift.
 
 Burst suppression:
 - if a no-op message arrives within `POST_UPDATE_BURST_SUPPRESS_SEC` after mapped update,
@@ -186,8 +208,15 @@ Mode transition rules:
 
 ## Confidence update
 
-- Hit in expected window: `confidence = min(100, confidence + CONFIDENCE_INC_HIT)`
-- Missed expected window: `confidence = max(0, confidence - CONFIDENCE_DEC_MISS)`
+- Hit (data received this wake cycle): `confidence = min(100, confidence + CONFIDENCE_INC_HIT)`
+  Applied regardless of whether the last plan was adaptive or fallback.
+  Without this, confidence can never recover from 0 (deadlock: adaptive needs
+  confidence, but confidence only grew in adaptive mode).
+- Missed (no data this wake cycle):
+  - `missedWindows` always incremented (even in fallback mode) so retrain can trigger.
+  - Confidence penalty applied **only when last plan was adaptive** — fallback timing
+    is not tuned to the data cadence, so misses in fallback are expected and should
+    not penalize the model.
 - If `missedWindows >= MAX_CONSECUTIVE_MISSES`: reset cadence model and return to
   continuous listening (retrain from scratch). Emits `cadence_retrain` AI log.
 
