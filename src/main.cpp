@@ -703,9 +703,57 @@ struct Trend3 {
   }
 };
 
-static Trend3 tempTrend;
-static Trend3 humidityTrend;
-static Trend3 pressureTrend;
+#define TREND_STORE_VERSION 1
+
+struct TrendStore {
+  Trend3 temp;
+  Trend3 humidity;
+  Trend3 pressure;
+  uint8_t version = TREND_STORE_VERSION;
+  uint32_t hash = 0;
+};
+
+RTC_DATA_ATTR static TrendStore trendStore;
+
+// Aliases so existing drawing/push code stays unchanged.
+static Trend3 &tempTrend = trendStore.temp;
+static Trend3 &humidityTrend = trendStore.humidity;
+static Trend3 &pressureTrend = trendStore.pressure;
+
+static uint32_t trendStoreChecksum(const TrendStore &store) {
+  TrendStore copy = store;
+  copy.hash = 0;
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < sizeof(TrendStore); i++) {
+    h ^= bytes[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static void trendStoreSave() {
+  trendStore.version = TREND_STORE_VERSION;
+  trendStore.hash = trendStoreChecksum(trendStore);
+}
+
+static void trendStoreReset() {
+  trendStore.temp = Trend3{};
+  trendStore.humidity = Trend3{};
+  trendStore.pressure = Trend3{};
+  trendStoreSave();
+}
+
+static bool trendStoreIsValid() {
+  if (trendStore.version != TREND_STORE_VERSION) return false;
+  return trendStore.hash == trendStoreChecksum(trendStore);
+}
+
+static void trendStoreInitFromRtc() {
+  if (!trendStoreIsValid()) {
+    trendStoreReset();
+  }
+}
 
 enum class TrendDir : int8_t { Flat = 0, Down = -1, Up = 1 };
 
@@ -1343,6 +1391,7 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
   }
 
   if (anyUpdate) {
+    trendStoreSave();
     mappedUpdateSeenThisWake = true;
     if (parsedTimestampValid) {
       cadenceOnObservedTimestamp(parsedTimestampEpoch);
@@ -1422,6 +1471,7 @@ void setup() {
   delay(200);
   wakeStartMs = millis();
   cadenceInitFromRtc();
+  trendStoreInitFromRtc();
 
   logBootInfo();
   logf("BOOT", "quiet boot enabled: display init+draw deferred until sensor data");
