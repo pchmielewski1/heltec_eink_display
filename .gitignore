@@ -9,3 +9,6 @@ include/secrets.h
 # Local Polish documentation copies (English docs stay canonical and tracked)
 *_PL.md
 **/*_PL.md
+
+# Raw framebuffer dumps (temporary debug files)
+dump.txt

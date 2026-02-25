@@ -1,5 +1,9 @@
 # Heltec Wireless Paper v1.1 – e‑ink dashboard (Wi‑Fi + MQTT)
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="e-ink display screenshot" />
+</p>
+
 Firmware for **Heltec Wireless Paper v1.1 (ESP32‑S3)**: connects to Wi‑Fi, keeps MQTT connection alive, subscribes to telemetry, and renders values on the e‑ink display (temperature / humidity / pressure).
 
 Key feature: **quiet boot** — after reset, firmware does *not touch e‑ink* (no "Booting/Connecting" screen) until valid mapped sensor data is received.
@@ -14,7 +18,7 @@ This project targets common IoT search intents around: **ESP32‑S3**, **Heltec 
 - MQTT telemetry ingest (plain numeric and JSON payloads)
 - Configurable JSON key mapping (`temperature`, `relative_humidity`, `barometric_pressure`)
 - Quiet boot with deferred display init (no unnecessary e‑ink flash on restart)
-- Trend arrows for temperature / humidity / pressure
+- Trend arrows for temperature / humidity / pressure (persisted across deep sleep via RTC memory)
 - Battery voltage read + percent estimation
 - AI-friendly structured logs (`event=... key=value`) for downstream automation
 - Adaptive deep sleep v1 (cadence learning + confidence/fallback planning)
@@ -222,28 +226,34 @@ Implementation spec v1: `docs/adaptive-deepsleep-spec-v1.md`
 To enable on device, set in `include/secrets.h`:
 - `DEEPSLEEP_ENABLE 1`
 - Optional tuning: `DEEPSLEEP_MIN_INTERVAL_SAMPLES` (default `2`, sleep can start after ~3 environmental updates)
-- Optional tuning: `DEEPSLEEP_CONFIDENCE_MIN` (higher = stricter adaptive entry, lower = earlier adaptive entry)
+- Optional tuning: `DEEPSLEEP_CONFIDENCE_MIN` (higher = stricter adaptive entry, lower = earlier adaptive entry; too high can keep device in fallback loop)
 - Optional tuning: `DEEPSLEEP_FALLBACK_SEC` (fallback sleep while training / low confidence)
-- Optional tuning: `DEEPSLEEP_MAX_SEC` (upper bound for slow sensors, e.g. 45+ min cadence)
+- Optional tuning: `DEEPSLEEP_MAX_SEC` (upper bound for slow sensors, e.g. 45+ min cadence; increase above 1800 for slow or variable cadence deployments)
 - Optional retained override topic: `DEEPSLEEP_RETAIN_MODE_TOPIC`
 - Optional safety tuning: `DEEPSLEEP_MIN_AWAKE_SEC`, `DEEPSLEEP_MAX_EMPTY_SLEEP_CYCLES`
 
-### Field validation snapshot (2026-02)
+## E‑ink screenshots
 
-- Verified on real device with mixed MQTT traffic (`telemetry` + `nodeinfo` + mapped environmental payloads).
-- Adaptive learning is triggered only by mapped environmental updates (`temperature`, `relative_humidity`, `barometric_pressure`).
-- Training gate behavior confirmed:
-   - first mapped update sets baseline timestamp,
-   - next mapped updates produce `cadence_update` samples,
-   - deep sleep starts after sample threshold is reached.
-- Adaptive planning confirmed in logs:
-   - `sleep_plan mode=adaptive reason=adaptive_median`
-   - `sleep_enter sleep_sec=...`
-   - wake via `sleep_wake cause=timer`.
-- Confidence threshold strongly affects behavior:
-   - too high can keep device in fallback loop (`fallback_confidence`),
-   - tuned threshold enables adaptive operation in low-frequency streams.
-- For slow or variable cadence deployments, increase `DEEPSLEEP_MAX_SEC` above 1800 to avoid clipping adaptive plans.
+Firmware dumps the raw framebuffer over Serial after every display refresh.
+You can capture and convert it to a PNG:
+
+1. Connect USB and open **Serial Monitor** (115200 baud).
+2. Wait for a display refresh — Serial output will contain a base64 block between
+   `---FRAMEBUFFER_START---` and `---FRAMEBUFFER_END---` markers.
+3. Copy that entire block (including markers) into a text file, e.g. `dump.txt`.
+4. Run the decoder:
+
+```bash
+python3 tools/decode_screenshot.py dump.txt docs/screenshot.png
+```
+
+The script has **no dependencies** beyond Python 3 standard library.
+Output is a 250×122 px grayscale PNG cropped to the visible e‑ink area.
+
+Files:
+- `tools/decode_screenshot.py` — framebuffer-to-PNG converter
+- `dump.txt` — example raw dump (git-ignored)
+- `docs/screenshot.png` — latest captured screenshot
 
 ## License status
 

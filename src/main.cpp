@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <mbedtls/base64.h>
 
 #include "secrets.h"
 
@@ -992,6 +993,28 @@ static void drawBigTemperature(int16_t x, int16_t y, const char *tempDigits, int
 
 
 
+static void dumpFramebufferSerial() {
+  // Framebuffer: 256x128 padded, 1-bit packed = 4096 bytes
+  const uint8_t *buf = display.buffer;
+  const size_t bufSize = 4096;
+  // Base64: output size = ceil(bufSize/3)*4 + 1
+  size_t b64Len = 0;
+  mbedtls_base64_encode(nullptr, 0, &b64Len, buf, bufSize);
+  uint8_t *b64 = (uint8_t *)malloc(b64Len + 1);
+  if (b64 == nullptr) {
+    logf("SCREENSHOT", "malloc failed for base64 (%u bytes)", (unsigned)b64Len);
+    return;
+  }
+  size_t written = 0;
+  mbedtls_base64_encode(b64, b64Len + 1, &written, buf, bufSize);
+  b64[written] = '\0';
+  Serial.println("---FRAMEBUFFER_START---");
+  Serial.println((const char *)b64);
+  Serial.println("---FRAMEBUFFER_END---");
+  free(b64);
+  logf("SCREENSHOT", "framebuffer dumped (%u bytes base64)", (unsigned)written);
+}
+
 static void VextON() {
   pinMode(45, OUTPUT);
   digitalWrite(45, LOW);
@@ -1192,6 +1215,7 @@ static void drawTemperatureScreen() {
 
   display.update(BLACK_BUFFER);
   display.display();
+  dumpFramebufferSerial();
 }
 
 static bool connectWiFi(unsigned long timeoutMs) {
