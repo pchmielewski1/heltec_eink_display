@@ -1,7 +1,7 @@
 # Heltec Wireless Paper v1.1 – e‑ink dashboard (Wi‑Fi + MQTT)
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="e-ink display screenshot" />
+  <img src="docs/screenshot.png" alt="e-ink display screenshot" width="375" height="183" />
 </p>
 
 Firmware for **Heltec Wireless Paper v1.1 (ESP32‑S3)**: connects to Wi‑Fi, keeps MQTT connection alive, subscribes to telemetry, and renders values on the e‑ink display (temperature / humidity / pressure).

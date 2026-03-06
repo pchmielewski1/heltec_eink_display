@@ -40,11 +40,11 @@
 #endif
 
 #ifndef DEEPSLEEP_MAX_SEC
-#define DEEPSLEEP_MAX_SEC (30 * 60)
+#define DEEPSLEEP_MAX_SEC (90 * 60)
 #endif
 
 #ifndef DEEPSLEEP_LISTEN_WINDOW_SEC
-#define DEEPSLEEP_LISTEN_WINDOW_SEC 90
+#define DEEPSLEEP_LISTEN_WINDOW_SEC 30
 #endif
 
 #ifndef DEEPSLEEP_FALLBACK_SEC
@@ -82,8 +82,8 @@
 #define CADENCE_MODEL_VERSION 1
 #define CADENCE_RING_SIZE 8
 #define CADENCE_MAX_INTERVAL_SEC (6 * 60 * 60)
-#define CADENCE_SAFETY_FLOOR_SEC 45
-#define CADENCE_RECONNECT_BUDGET_SEC 20
+#define CADENCE_SAFETY_FLOOR_SEC 27
+#define CADENCE_RECONNECT_BUDGET_SEC 12
 #define CADENCE_MAD_MULTIPLIER 3
 #define CADENCE_CONFIDENCE_INC_HIT 8
 #define CADENCE_CONFIDENCE_DEC_MISS 15
@@ -128,6 +128,7 @@ static bool mappedUpdateSeenThisWake = false;
 static bool sleepStateHandled = false;
 static bool trainingWaitLogged = false;
 static bool mqttConnectedThisWake = false;
+static unsigned long mqttConnectMs = 0;
 static bool retainFlagSeenThisWake = false;
 static bool sleepInhibitLogged = false;
 
@@ -513,8 +514,12 @@ static void maybeEnterDeepSleep(unsigned long nowMs) {
     logAi("mode_flag", "value=missing source=broker action=reset_to_adaptive");
   }
 
+  // Anchor listen window to MQTT connect time (not boot) so the full
+  // window is available for receiving data, independent of WiFi/MQTT
+  // reconnect duration.  Falls back to wakeStartMs defensively.
+  const unsigned long listenRef = (mqttConnectMs > 0) ? mqttConnectMs : wakeStartMs;
   const unsigned long listenWindowMs = (unsigned long)DEEPSLEEP_LISTEN_WINDOW_SEC * 1000UL;
-  if ((nowMs - wakeStartMs) < listenWindowMs) return;
+  if ((nowMs - listenRef) < listenWindowMs) return;
 
   if (cadenceMode() == SleepMode::Adaptive && cadenceModel.mappedCount < DEEPSLEEP_MIN_INTERVAL_SAMPLES) {
     if (!trainingWaitLogged) {
@@ -1466,6 +1471,9 @@ static bool ensureMqttConnected() {
   logf("MQTT", "connected in %lums", (millis() - start));
   logAi("mqtt_connect", "result=ok elapsed_ms=%lu", (unsigned long)(millis() - start));
   mqttConnectedThisWake = true;
+  if (mqttConnectMs == 0) {
+    mqttConnectMs = millis();
+  }
 
   if (mqttClient.subscribe(MQTT_SUBSCRIBE_TOPIC)) {
     logf("MQTT", "subscribed topic=%s", MQTT_SUBSCRIBE_TOPIC);
